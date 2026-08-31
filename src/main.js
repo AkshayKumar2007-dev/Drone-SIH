@@ -533,6 +533,129 @@ armPositions.forEach(p => {
   propellerGroups.push(propGroup);
 });
 
+// ==========================================
+// MOTOR DAMAGE MODEL
+// ==========================================
+// Motor layout: 0=FrontRight(CW), 1=FrontLeft(CCW), 2=RearRight(CCW), 3=RearLeft(CW)
+const MOTOR_NAMES = ['Front-R', 'Front-L', 'Rear-R', 'Rear-L'];
+const motors = [
+  { health: 100, rpm: 0, targetRpm: 0, failed: false, failureType: null, wear: 0, temp: 25 },
+  { health: 100, rpm: 0, targetRpm: 0, failed: false, failureType: null, wear: 0, temp: 25 },
+  { health: 100, rpm: 0, targetRpm: 0, failed: false, failureType: null, wear: 0, temp: 25 },
+  { health: 100, rpm: 0, targetRpm: 0, failed: false, failureType: null, wear: 0, temp: 25 },
+];
+
+// Battery sag model
+const batterySag = { voltage: 12.6, sagAmount: 0, maxSag: 0, tempFactor: 1 };
+
+// Emergency state
+let emergencyMode = false;
+let emergencyReason = '';
+
+function damageMotor(index, damage) {
+  if (index < 0 || index >= 4 || motors[index].failed) return;
+  motors[index].health = Math.max(0, motors[index].health - damage);
+  if (motors[index].health <= 0) {
+    motors[index].health = 0;
+    motors[index].failed = true;
+    motors[index].failureType = 'burnout';
+    triggerEmergency(`Motor ${MOTOR_NAMES[index]} BURNOUT`);
+  } else if (motors[index].health < 30) {
+    triggerEmergency(`Motor ${MOTOR_NAMES[index]} DEGRADED (${Math.round(motors[index].health)}%)`);
+  }
+}
+
+function failMotor(index, type = 'seizure') {
+  if (index < 0 || index >= 4) return;
+  motors[index].health = 0;
+  motors[index].failed = true;
+  motors[index].failureType = type;
+  motors[index].rpm = 0;
+  triggerEmergency(`Motor ${MOTOR_NAMES[index]} ${type.toUpperCase()}`);
+}
+
+function triggerEmergency(reason) {
+  emergencyMode = true;
+  emergencyReason = reason;
+}
+
+function clearEmergency() {
+  emergencyMode = false;
+  emergencyReason = '';
+}
+
+// Crash damage: randomly damage 0-2 motors
+function applyCrashDamage(severity) {
+  const numMotors = severity > 8 ? 2 : severity > 5 ? 1 : 0;
+  for (let i = 0; i < numMotors; i++) {
+    const idx = Math.floor(Math.random() * 4);
+    const dmg = 15 + Math.random() * 40 * severity / 10;
+    damageMotor(idx, dmg);
+  }
+  // Battery sag from impact
+  batterySag.sagAmount += severity * 0.3;
+}
+
+// Random in-flight motor failure (very rare)
+function checkRandomFailure(dt) {
+  if (!state.armed || isCrashed) return;
+  motors.forEach((m, i) => {
+    if (m.failed) return;
+    // Wear accumulates with throttle and time
+    m.wear += dt * (0.001 + manualThrottle * 0.003);
+    // Overheating causes accelerated wear
+    if (state.engineTemp > 100) m.wear += dt * 0.01;
+    if (m.wear > 1.0 && Math.random() < 0.0008 * dt * 60) {
+      damageMotor(i, 10 + Math.random() * 20);
+    }
+    // Extremely rare spontaneous failure
+    if (Math.random() < 0.00002 * dt * 60) {
+      failMotor(i, Math.random() > 0.5 ? 'seizure' : 'propeller_loss');
+    }
+  });
+}
+
+// Battery sag update
+function updateBatterySag(dt) {
+  if (!state.armed || isCrashed) {
+    batterySag.sagAmount = THREE.MathUtils.lerp(batterySag.sagAmount, 0, dt * 2);
+    batterySag.voltage = THREE.MathUtils.lerp(batterySag.voltage, 12.6, dt);
+    return;
+  }
+  // Sag proportional to throttle demand
+  const targetSag = manualThrottle * 2.8 + (manualThrottle > 0.7 ? (manualThrottle - 0.7) * 4 : 0);
+  batterySag.sagAmount = THREE.MathUtils.lerp(batterySag.sagAmount, targetSag, dt * 3);
+  // Temperature amplifies sag
+  batterySag.tempFactor = state.engineTemp > 90 ? 1 + (state.engineTemp - 90) * 0.03 : 1;
+  batterySag.voltage = Math.max(9.0, 12.6 - batterySag.sagAmount * batterySag.tempFactor);
+  // Critical low voltage
+  if (batterySag.voltage < 10.0 && state.armed) {
+    triggerEmergency('BATTERY CRITICAL LOW VOLTAGE');
+  }
+}
+
+function resetMotors() {
+  motors.forEach(m => {
+    m.health = 100; m.rpm = 0; m.targetRpm = 0;
+    m.failed = false; m.failureType = null; m.wear = 0; m.temp = 25;
+  });
+  batterySag.voltage = 12.6;
+  batterySag.sagAmount = 0;
+  batterySag.tempFactor = 1;
+  clearEmergency();
+}
+
+// Stall parameters
+const STALL = {
+  warningAngle: 18,    // degrees — stall warning starts
+  criticalAngle: 30,   // degrees — full stall onset
+  deepStallAngle: 45,  // degrees — deep stall, severe loss
+  stallDragCoeff: 3.5, // extra drag multiplier during stall
+};
+
+// Motor health UI elements
+const motorHealthEls = [];
+
 // Landing Gear Skids (Visual bottom at y = -0.31)
 [-0.28, 0.28].forEach(x => {
   const strutF = new THREE.Mesh(new THREE.CylinderGeometry(0.016, 0.016, 0.38, 6), new THREE.MeshStandardMaterial({ color: 0x3a3f4a }));
@@ -752,6 +875,9 @@ const state = {
   oilPressure: 48,
   fuelPressure: 44,
   pressDiff: 0,
+  stallAngle: 0,       // current angle of attack in degrees
+  stallFactor: 1.0,     // 1.0 = normal, 0.0 = full stall
+  stallWarning: false,  // true when angle > critical threshold
 };
 
 const params = {
@@ -783,10 +909,16 @@ const WIND = {
   verticalGust: 0
 };
 
-// Flight modes: 0 Manual, 1 Stabilize (default), 2 Alt Hold
+// Flight modes: 0 Manual, 1 Stabilize (default), 2 Alt Hold, 3 Loiter (GPS Position Hold)
 let flightMode = 1;
-const flightModeNames = ['MANUAL / ACRO', 'STABILIZE', 'ALT HOLD'];
+const flightModeNames = ['MANUAL / ACRO', 'STABILIZE', 'ALT HOLD', 'LOITER'];
 let altHoldTarget = 3.5;
+let loiterTarget = { x: 0, z: 0 };
+let loiterEngaged = false;
+
+// Position PIDs for Loiter mode (horizontal hold)
+const pidPosX = { kp: 0.35, ki: 0.02, kd: 0.18, integral: 0 };
+const pidPosZ = { kp: 0.35, ki: 0.02, kd: 0.18, integral: 0 };
 
 // Attitude PID Controllers (Analytically critically damped for I=0.11kg*m^2)
 const pidPitch = { kp: 1.4, ki: 0.15, kd: 0.38, integral: 0 };
@@ -852,15 +984,13 @@ let noCrashUntil = 0;
 let yawAccum = 0, rollAccum = 0, combinedAccum = 0, yawRollState = 0;
 
 function updateYawRollFailure(dt) {
-  const invQ = new CANNON.Quaternion();
-  droneBody.quaternion.inverse(invQ);
-  const bodyAng = new CANNON.Vec3();
-  invQ.vmult(droneBody.angularVelocity, bodyAng);
-  const yawRate = Math.abs(bodyAng.y);
+  droneBody.quaternion.inverse(_v4); // reuse _v4 as temp quaternion
+  _v4.vmult(droneBody.angularVelocity, _v5); // reuse _v5
+  const yawRate = Math.abs(_v5.y);
 
   const q = droneBody.quaternion;
-  const localRight = new CANNON.Vec3();
-  q.vmult(new CANNON.Vec3(1, 0, 0), localRight);
+  _v1.set(1, 0, 0); q.vmult(_v1, _v3); // reuse _v3
+  const localRight = _v3;
   const rollAngle = Math.abs(Math.asin(THREE.MathUtils.clamp(-localRight.y, -1, 1)));
 
   const yawWarn = 4.5;
@@ -922,11 +1052,15 @@ function resetDrone() {
   manualThrottle = 0;
   filteredPitch = 0;
   filteredRoll = 0;
+  resetMotors();
 
   pidPitch.integral = 0;
   pidRoll.integral = 0;
   pidYaw.integral = 0;
+  pidPosX.integral = 0;
+  pidPosZ.integral = 0;
   altHoldTarget = 3.5;
+  loiterEngaged = false;
 
   yawAccum = 0;
   rollAccum = 0;
@@ -996,6 +1130,9 @@ function triggerCrash(reason) {
   isCrashed = true;
   crashTimer = 1.6;
   crashCount++;
+  // Apply crash damage to motors based on impact severity
+  const severity = Math.min(10, droneBody.velocity.length());
+  applyCrashDamage(severity);
   if (crashReasonEl) crashReasonEl.textContent = reason;
   if (crashOverlay) crashOverlay.classList.add('show');
   if (flashEl) {
@@ -1027,11 +1164,11 @@ function updateThrottleUI(throttle) {
   if (thrPctEl) thrPctEl.textContent = pct + '%';
   if (thrFillEl) thrFillEl.style.width = pct + '%';
   if (thrHintEl) {
-    if (!state.armed) thrHintEl.textContent = 'Disarmed · Press W or Space to Arm & Climb';
-    else if (throttle < 0.05) thrHintEl.textContent = 'Throttle 0% · Hold W to increase';
-    else if (throttle >= 0.32 && throttle <= 0.38) thrHintEl.textContent = 'Hover Throttle (~35%) · W↑ S↓';
+    if (!state.armed) thrHintEl.textContent = 'Disarmed · Press Space to Arm & Climb';
+    else if (throttle < 0.05) thrHintEl.textContent = 'Throttle 0% · Hold Space to increase';
+    else if (throttle >= 0.32 && throttle <= 0.38) thrHintEl.textContent = 'Hover Throttle (~35%) · Space↑ Shift↓';
     else if (throttle > 0.75) thrHintEl.textContent = 'High Power · Rapid Climb';
-    else thrHintEl.textContent = 'Manual Throttle Stick · W↑ S↓ or use slider';
+    else thrHintEl.textContent = 'Manual Throttle · Space↑ Shift↓ (returns to hover)';
   }
 }
 
@@ -1039,7 +1176,7 @@ function updateWind(dt) {
   const t = clock.getElapsedTime();
   if (!WIND.enabled) {
     WIND.currentSpeed = THREE.MathUtils.lerp(WIND.currentSpeed, 0, dt * 2);
-    WIND.vec.lerp(new THREE.Vector3(0, 0, 0), dt * 2);
+    _tv2.set(0, 0, 0); WIND.vec.lerp(_tv2, dt * 2);
   } else {
     const gust = Math.sin(t * 0.35) * 0.5 + Math.sin(t * 0.82) * 0.3;
     WIND.currentSpeed = THREE.MathUtils.clamp(WIND.baseSpeed + gust, 0.2, 8.5);
@@ -1132,8 +1269,24 @@ window.addEventListener('keydown', e => {
   if (e.code === 'KeyV') WIND.enabled = !WIND.enabled;
   if (e.code === 'KeyU') audio.toggleMute();
   if (e.code === 'KeyM') {
-    flightMode = (flightMode + 1) % 3;
+    const prevMode = flightMode;
+    flightMode = (flightMode + 1) % 4;
     if (flightMode === 2) altHoldTarget = Math.max(2.0, droneBody.position.y);
+    if (flightMode === 3) {
+      // Engage loiter: record current position as hold target
+      loiterTarget.x = droneBody.position.x;
+      loiterTarget.z = droneBody.position.z;
+      loiterEngaged = true;
+      altHoldTarget = Math.max(0.4, droneBody.position.y);
+      pidPosX.integral = 0;
+      pidPosZ.integral = 0;
+    }
+    if (prevMode === 3 && flightMode !== 3) {
+      // Leaving loiter: clear position PIDs
+      loiterEngaged = false;
+      pidPosX.integral = 0;
+      pidPosZ.integral = 0;
+    }
   }
   if (e.code === 'KeyN') dayPhase = (dayPhase + 1) % 2;
   if (e.code === 'KeyG') {
@@ -1157,6 +1310,18 @@ window.addEventListener('resize', () => {
 
 const clock = new THREE.Clock();
 let propSpin = 0;
+
+// Pre-allocated reusable vectors (avoids GC pressure in animate loop)
+const _v1 = new CANNON.Vec3();
+const _v2 = new CANNON.Vec3();
+const _v3 = new CANNON.Vec3();
+const _v4 = new CANNON.Quaternion();
+const _v5 = new CANNON.Vec3();
+const _v6 = new CANNON.Vec3();
+const _v7 = new CANNON.Vec3();
+const _v8 = new CANNON.Vec3();
+const _tv1 = new THREE.Vector3();
+const _tv2 = new THREE.Vector3();
 
 // ==========================================
 // MAIN SIMULATION & ANIMATION LOOP
@@ -1184,25 +1349,27 @@ function animate() {
 
   // 2. Manual Throttle Stick Management
   if (state.armed && !isCrashed) {
-    if (flightMode === 2) {
-      // ALT HOLD Mode (Automatic Altitude PID)
+    if (flightMode === 2 || flightMode === 3) {
+      // ALT HOLD / LOITER Mode (Automatic Altitude PID)
       if (climbInput !== 0) {
         altHoldTarget = Math.max(0.4, altHoldTarget + climbInput * 3.5 * dt);
       }
-      // Hover throttle increases at altitude where air is thinner
       const hoverThrottle = THREE.MathUtils.clamp(0.35 / Math.max(state.densityFactor, 0.55), 0.35, 0.75);
       const altErr = altHoldTarget - droneBody.position.y;
       const vsErr = -droneBody.velocity.y;
       const altCorrection = altErr * 0.24 + vsErr * 0.16;
       manualThrottle = THREE.MathUtils.clamp(hoverThrottle + altCorrection, 0.05, 0.95);
     } else {
-      // STABILIZE & MANUAL Modes: Direct throttle stick (W=up, S=down, retains last value)
+      // STABILIZE & MANUAL Modes: Direct throttle stick
+      // Space = ramp up, Shift = ramp down, release = slowly return to hover
       if (climbInput > 0) {
         manualThrottle = THREE.MathUtils.clamp(manualThrottle + dt * 0.55, 0, 1);
       } else if (climbInput < 0) {
         manualThrottle = THREE.MathUtils.clamp(manualThrottle - dt * 0.55, 0, 1);
+      } else {
+        // Spring-return: throttle slowly returns to hover when no input
+        manualThrottle = THREE.MathUtils.lerp(manualThrottle, 0.35, dt * 1.8);
       }
-      // Throttle holds its value when stick is released (like a real transmitter)
     }
     // Sync slider with current throttle
     if (throttleSliderEl) throttleSliderEl.value = manualThrottle;
@@ -1222,6 +1389,10 @@ function animate() {
     state.battery = Math.min(100, state.battery + params.battRechargeRate * dt);
   }
 
+  // Damage model updates
+  updateBatterySag(dt);
+  checkRandomFailure(dt);
+
   updateWind(dt);
   updatePressures(dt, manualThrottle);
   updateEngineHeat(dt, manualThrottle);
@@ -1234,18 +1405,17 @@ function animate() {
   let effectiveThrottle = manualThrottle * (state.fuel > 0 ? 1 : 0) * (state.battery > 0 ? 1 : 0);
   effectiveThrottle *= updateYawRollFailure.thrustFactor;
 
-  // Extract Drone's Principal Axes in World Coordinates
+  // Extract Drone's Principal Axes in World Coordinates (reused vectors)
   const q = droneBody.quaternion;
-  const localForward = new CANNON.Vec3();
-  q.vmult(new CANNON.Vec3(0, 0, 1), localForward); // Nose vector (+Z)
-  const localRight = new CANNON.Vec3();
-  q.vmult(new CANNON.Vec3(1, 0, 0), localRight);   // Right wing vector (+X)
+  _v1.set(0, 0, 1); q.vmult(_v1, _v2); // _v2 = localForward (nose +Z)
+  const localForward = _v2;
+  _v1.set(1, 0, 0); q.vmult(_v1, _v3); // _v3 = localRight (right wing +X)
+  const localRight = _v3;
 
   // Local Angular Velocity in Body Coordinates
-  const invQ = new CANNON.Quaternion();
-  q.inverse(invQ);
-  const bodyAngVel = new CANNON.Vec3();
-  invQ.vmult(droneBody.angularVelocity, bodyAngVel);
+  q.inverse(_v4); // _v4 = invQ (reused)
+  _v4.vmult(droneBody.angularVelocity, _v5); // _v5 = bodyAngVel
+  const bodyAngVel = _v5;
 
   // Measure Real Physical Attitude Angles:
   // Pitch: Angle between nose (+Z) and ground plane.
@@ -1256,14 +1426,69 @@ function animate() {
   // When right wing tilts down (roll right), localRight.y < 0 -> currentRoll > 0.
   const currentRoll = Math.asin(THREE.MathUtils.clamp(-localRight.y, -1, 1));
 
+  // ── STALL MODEL: Compute total angle of attack ──
+  // Total tilt = combined pitch + roll angle in degrees
+  const totalTiltDeg = THREE.MathUtils.radToDeg(Math.sqrt(currentPitch * currentPitch + currentRoll * currentRoll));
+  state.stallAngle = totalTiltDeg;
+
+  // Stall factor curve: smooth falloff from 1.0 (normal) to 0.0 (deep stall)
+  if (totalTiltDeg < STALL.warningAngle) {
+    state.stallFactor = 1.0;
+    state.stallWarning = false;
+  } else if (totalTiltDeg < STALL.criticalAngle) {
+    // Warning zone: gentle thrust reduction (100% → 70%)
+    const t = (totalTiltDeg - STALL.warningAngle) / (STALL.criticalAngle - STALL.warningAngle);
+    state.stallFactor = 1.0 - t * 0.30;
+    state.stallWarning = true;
+  } else if (totalTiltDeg < STALL.deepStallAngle) {
+    // Stall zone: steep thrust loss (70% → 25%)
+    const t = (totalTiltDeg - STALL.criticalAngle) / (STALL.deepStallAngle - STALL.criticalAngle);
+    state.stallFactor = 0.70 - t * 0.45;
+    state.stallWarning = true;
+  } else {
+    // Deep stall: severe loss (25% → 5%)
+    const t = Math.min(1, (totalTiltDeg - STALL.deepStallAngle) / 20);
+    state.stallFactor = 0.25 - t * 0.20;
+    state.stallWarning = true;
+  }
+
   // Desired Flight Attitude
   let desiredPitch = 0;
   let desiredRoll = 0;
   let desiredYawRate = yawInput * params.yawSpeed;
 
-  if (flightMode >= 1) { // STABILIZE or ALT HOLD
+  if (flightMode >= 1) { // STABILIZE, ALT HOLD, or LOITER
     desiredPitch = -targetPitch * params.maxTilt;
     desiredRoll = targetRoll * params.maxTilt;
+  }
+
+  // LOITER: Position hold PID — generates pitch/roll from position error
+  if (flightMode === 3 && loiterEngaged) {
+    const posErrX = loiterTarget.x - droneBody.position.x;
+    const posErrZ = loiterTarget.z - droneBody.position.z;
+    const velX = droneBody.velocity.x;
+    const velZ = droneBody.velocity.z;
+
+    // Integrate position error (with anti-windup)
+    pidPosX.integral = THREE.MathUtils.clamp(pidPosX.integral + posErrX * dt, -0.8, 0.8);
+    pidPosZ.integral = THREE.MathUtils.clamp(pidPosZ.integral + posErrZ * dt, -0.8, 0.8);
+
+    // PID output: desired tilt to correct position
+    // X position error → pitch correction (tilt forward/back)
+    // Z position error → roll correction (tilt left/right)
+    const loiterPitch = (posErrX * pidPosX.kp + pidPosX.integral * pidPosX.ki - velX * pidPosX.kd) * params.maxTilt;
+    const loiterRoll = (posErrZ * pidPosZ.kp + pidPosZ.integral * pidPosZ.ki - velZ * pidPosZ.kd) * params.maxTilt;
+
+    // Blend: stick input moves the loiter target, PID holds the new position
+    if (Math.abs(targetPitch) > 0.1 || Math.abs(targetRoll) > 0.1) {
+      // Stick input: offset the loiter target
+      loiterTarget.x += targetPitch * 2.0 * dt;
+      loiterTarget.z += targetRoll * 2.0 * dt;
+    } else {
+      // No stick input: PID holds position
+      desiredPitch = THREE.MathUtils.clamp(loiterPitch, -params.maxTilt, params.maxTilt);
+      desiredRoll = THREE.MathUtils.clamp(loiterRoll, -params.maxTilt, params.maxTilt);
+    }
   }
 
   // Slew rate smoothing on attitude commands
@@ -1319,57 +1544,89 @@ function animate() {
     // Add lateral wind shear gusts
     const gustX = (Math.random() - 0.5) * altInstability * 18;
     const gustZ = (Math.random() - 0.5) * altInstability * 18;
-    droneBody.applyForce(new CANNON.Vec3(gustX, 0, gustZ), new CANNON.Vec3(0, 0, 0));
+    _v6.set(gustX, 0, gustZ); droneBody.applyForce(_v6, _v8.set(0, 0, 0));
   }
 
   // ALWAYS apply PID torque to maintain level attitude (even during ground-to-air transition)
   if (state.armed && !isCrashed) {
-    const worldTorque = new CANNON.Vec3();
-    q.vmult(new CANNON.Vec3(torquePitch, torqueYaw, torqueRoll), worldTorque);
-    droneBody.torque.copy(worldTorque);
+    _v1.set(torquePitch, torqueYaw, torqueRoll); q.vmult(_v1, _v6); // _v6 = worldTorque
+    droneBody.torque.copy(_v6);
   }
 
-  // Apply thrust and ground effect only when producing lift
+  // Apply per-motor thrust (damage model) + ground effect
   if (state.armed && effectiveThrottle > 0.05 && !isCrashed) {
-    // Apply total collective thrust upward along local Y
-    // Extra thrust loss above 350m compounds instability at altitude
     const altThrustLoss = droneBody.position.y > 350 ? (1 - altInstability * 0.30) : 1;
-    const totalThrust = effectiveThrottle * 66.0 * state.densityFactor * altThrustLoss;
-    const worldThrust = new CANNON.Vec3();
-    q.vmult(new CANNON.Vec3(0, totalThrust, 0), worldThrust);
-    droneBody.applyForce(worldThrust, new CANNON.Vec3(0, 0, 0));
+    const voltageFactor = Math.max(0.6, batterySag.voltage / 12.6);
+    const perMotorMaxThrust = 16.5 * state.densityFactor * altThrustLoss * voltageFactor * state.stallFactor;
+
+    // Apply each motor's thrust at its arm position
+    for (let i = 0; i < 4; i++) {
+      const pos = armPositions[i];
+      const m = motors[i];
+      const healthFactor = m.failed ? 0 : m.health / 100;
+      // RPM simulation for visual and failure modeling
+      m.targetRpm = effectiveThrottle * 12000 * healthFactor;
+      m.rpm += (m.targetRpm - m.rpm) * dt * 8;
+      // Motor heat from load
+      const heatTarget = state.armed ? (25 + manualThrottle * 45 + (m.health < 50 ? 30 : 0)) : 25;
+      m.temp += (heatTarget - m.temp) * dt * 0.5;
+
+      if (healthFactor <= 0) continue;
+
+      const motorThrust = effectiveThrottle * perMotorMaxThrust * healthFactor;
+      _v1.set(0, motorThrust, 0); q.vmult(_v1, _v6); // _v6 = worldThrust
+      _v7.set(pos.x, 0, pos.z); // motorOffset
+      droneBody.applyForce(_v6, _v7);
+    }
 
     // Ground effect cushion when taking off (alt < 0.65m)
     if (droneBody.position.y < 0.65) {
       const groundFactor = Math.max(0, (0.65 - droneBody.position.y) / 0.65);
-      droneBody.applyForce(new CANNON.Vec3(0, groundFactor * 2.5, 0), new CANNON.Vec3(0, 0, 0));
+      droneBody.applyForce(_v8.set(0, groundFactor * 2.5, 0), _v1.set(0, 0, 0));
       droneBody.velocity.x *= (1 - groundFactor * 0.12);
       droneBody.velocity.z *= (1 - groundFactor * 0.12);
+    }
+
+    // ── STALL DRAG: Increased lateral drag at high angle of attack ──
+    if (state.stallWarning && state.stallFactor < 1.0) {
+      const stallDragMult = (1 - state.stallFactor) * STALL.stallDragCoeff;
+      // Apply extra drag opposing horizontal velocity (simulates air resistance on flat surface)
+      const horizSpeed = Math.sqrt(droneBody.velocity.x ** 2 + droneBody.velocity.z ** 2);
+      if (horizSpeed > 0.1) {
+        const stallDragForce = -stallDragMult * horizSpeed * 0.5 * state.densityFactor;
+        _v6.set(droneBody.velocity.x * stallDragForce, 0, droneBody.velocity.z * stallDragForce);
+        droneBody.applyForce(_v6, _v8.set(0, 0, 0));
+      }
+      // Apply extra downward drag (stall reduces lift → effective weight increase)
+      const liftLoss = (1 - state.stallFactor) * 4.5; // up to 4.5N extra downward force
+      droneBody.applyForce(_v8.set(0, -liftLoss, 0), _v1.set(0, 0, 0));
+      // Reduce PID authority during stall (controls feel mushy)
+      const stallPidDegrade = 1 - (1 - state.stallFactor) * 0.5;
+      torquePitch *= stallPidDegrade;
+      torqueRoll *= stallPidDegrade;
+      _v1.set(torquePitch, torqueYaw, torqueRoll); q.vmult(_v1, _v6);
+      droneBody.torque.copy(_v6);
     }
   }
 
   // 4. Environmental Wind & Aerodynamic Drag
   if (WIND.enabled) {
-    const relWind = new CANNON.Vec3(
-      WIND.vec.x - droneBody.velocity.x,
-      WIND.vec.y - droneBody.velocity.y,
-      WIND.vec.z - droneBody.velocity.z
-    );
     const windAlt = droneBody.position.y < 2 ? Math.max(0.2, droneBody.position.y / 2) : 1;
-    // Wind force scales with air density — thinner air = less push at altitude
     const windDensity = state.densityFactor;
-    droneBody.applyForce(
-      new CANNON.Vec3(relWind.x * 0.24 * windAlt * windDensity, relWind.y * 0.12 * windDensity, relWind.z * 0.24 * windAlt * windDensity),
-      new CANNON.Vec3(0, 0, 0)
+    _v6.set(
+      (WIND.vec.x - droneBody.velocity.x) * 0.24 * windAlt * windDensity,
+      (WIND.vec.y - droneBody.velocity.y) * 0.12 * windDensity,
+      (WIND.vec.z - droneBody.velocity.z) * 0.24 * windAlt * windDensity
     );
+    droneBody.applyForce(_v6, _v8.set(0, 0, 0));
   }
 
   // Natural aerodynamic velocity drag — scales with air density
   const velLen = droneBody.velocity.length();
   if (velLen > 0.05) {
-    const drag = new CANNON.Vec3().copy(droneBody.velocity);
-    drag.scale(-0.24 * velLen * 0.08 * state.densityFactor, drag);
-    droneBody.applyForce(drag, new CANNON.Vec3(0, 0, 0));
+    const dragScale = -0.24 * velLen * 0.08 * state.densityFactor;
+    _v6.set(droneBody.velocity.x * dragScale, droneBody.velocity.y * dragScale, droneBody.velocity.z * dragScale);
+    droneBody.applyForce(_v6, _v8.set(0, 0, 0));
   }
 
 
@@ -1381,11 +1638,19 @@ function animate() {
   drone.position.copy(droneBody.position);
   drone.quaternion.copy(droneBody.quaternion);
 
-  // Visual Propeller Animation
-  const baseSpin = state.armed ? (28 + effectiveThrottle * 60) : 0;
-  propSpin += baseSpin * dt;
+  // Visual Propeller Animation — reflects motor health
+  propSpin += dt * 60;
   propellerGroups.forEach((pg, i) => {
-    pg.rotation.y = propSpin * (i % 2 === 0 ? 1 : -1);
+    const m = motors[i];
+    if (m.failed || m.health <= 0) {
+      // Damaged prop: slow wobble or stopped
+      pg.rotation.y += (m.failureType === 'propeller_loss' ? 0 : dt * 2 * Math.sin(t * 3 + i));
+      pg.visible = m.failureType !== 'propeller_loss';
+    } else {
+      const spinSpeed = state.armed ? (28 + effectiveThrottle * 60) * (m.health / 100) : 0;
+      pg.rotation.y = propSpin * spinSpeed * (i % 2 === 0 ? 1 : -1);
+      pg.visible = true;
+    }
   });
 
   // Strobe Light blink
@@ -1441,6 +1706,90 @@ function animate() {
   if (battHudEl) battHudEl.textContent = Math.ceil(state.battery) + '%';
   if (modeHudEl) modeHudEl.textContent = flightModeNames[flightMode];
 
+  // Motor health UI
+  let motorsOk = 0;
+  motors.forEach((m, i) => {
+    const bar = document.getElementById('m' + i + '-bar');
+    const pct = document.getElementById('m' + i + '-pct');
+    if (bar) {
+      bar.style.width = m.health + '%';
+      if (m.failed) bar.style.background = 'linear-gradient(90deg,#ff3a3a,#ff0055)';
+      else if (m.health < 30) bar.style.background = 'linear-gradient(90deg,#ff3a3a,#ff8a00)';
+      else if (m.health < 70) bar.style.background = 'linear-gradient(90deg,#ffd43a,#ff8a00)';
+      else bar.style.background = 'linear-gradient(90deg,#00ff88,#00d0ff)';
+    }
+    if (pct) {
+      pct.textContent = m.failed ? 'FAIL' : Math.round(m.health) + '%';
+      pct.style.color = m.failed ? '#ff3a3a' : m.health < 30 ? '#ff8a00' : '#eafff2';
+    }
+    if (!m.failed) motorsOk++;
+  });
+  const motorSummaryEl = document.getElementById('motor-summary');
+  if (motorSummaryEl) {
+    motorSummaryEl.textContent = motorsOk + '/4 OK';
+    motorSummaryEl.style.color = motorsOk === 4 ? '#00ff88' : motorsOk >= 3 ? '#ffd43a' : '#ff3a3a';
+  }
+  const motorHintEl = document.getElementById('motor-hint');
+  if (motorHintEl) {
+    const failedMotors = motors.filter(m => m.failed);
+    if (failedMotors.length === 0) motorHintEl.textContent = 'All motors nominal';
+    else motorHintEl.textContent = failedMotors.map(m => MOTOR_NAMES[motors.indexOf(m)] + ' ' + m.failureType).join(' · ');
+    motorHintEl.style.color = failedMotors.length ? '#ff7a7a' : '#7a8a9a';
+  }
+
+  // Battery voltage UI
+  const voltPctEl = document.getElementById('volt-pct');
+  const voltFillEl = document.getElementById('volt-fill');
+  const voltHintEl = document.getElementById('volt-hint');
+  if (voltPctEl) voltPctEl.textContent = batterySag.voltage.toFixed(1) + 'V';
+  if (voltFillEl) {
+    const vPct = Math.max(0, ((batterySag.voltage - 9) / 3.6) * 100);
+    voltFillEl.style.width = vPct + '%';
+    voltFillEl.style.background = batterySag.voltage < 10 ? 'linear-gradient(90deg,#ff3a3a,#ff0055)' : batterySag.voltage < 11 ? 'linear-gradient(90deg,#ffd43a,#ff8a00)' : 'linear-gradient(90deg,#ffd43a,#ff8a00)';
+  }
+  if (voltHintEl) {
+    if (batterySag.voltage < 10) voltHintEl.textContent = '⚠ CRITICAL — Emergency landing recommended';
+    else if (batterySag.voltage < 11.5) voltHintEl.textContent = `Sag: -${(12.6 - batterySag.voltage).toFixed(1)}V under load`;
+    else voltHintEl.textContent = 'Nominal · No sag';
+  }
+
+  // Emergency banner
+  const emergBanner = document.getElementById('emergency-banner');
+  if (emergBanner) {
+    if (emergencyMode) {
+      emergBanner.style.display = 'block';
+      emergBanner.textContent = '🚨 EMERGENCY — ' + emergencyReason;
+    } else {
+      emergBanner.style.display = 'none';
+    }
+  }
+
+  // Stall warning banner
+  const stallBanner = document.getElementById('stall-banner');
+  if (stallBanner) {
+    if (state.stallWarning && state.armed && !isCrashed) {
+      stallBanner.style.display = 'block';
+      if (state.stallAngle >= STALL.deepStallAngle) {
+        stallBanner.textContent = `⚠️ DEEP STALL — ${state.stallAngle.toFixed(0)}° TILT — REDUCE ANGLE IMMEDIATELY`;
+        stallBanner.style.background = 'rgba(255,0,0,0.3)';
+        stallBanner.style.borderColor = '#ff3a3a';
+        stallBanner.style.color = '#ff7a7a';
+      } else if (state.stallAngle >= STALL.criticalAngle) {
+        stallBanner.textContent = `⚠️ STALL — ${state.stallAngle.toFixed(0)}° TILT — Thrust ${Math.round(state.stallFactor * 100)}%`;
+        stallBanner.style.background = 'rgba(255,120,0,0.25)';
+        stallBanner.style.borderColor = '#ff7800';
+        stallBanner.style.color = '#ffaa55';
+      } else {
+        stallBanner.textContent = `⚡ PRE-STALL — ${state.stallAngle.toFixed(0)}° — Level out`;
+        stallBanner.style.background = 'rgba(255,165,0,0.22)';
+        stallBanner.style.borderColor = '#ff9500';
+        stallBanner.style.color = '#ffb84d';
+      }
+    } else {
+      stallBanner.style.display = 'none';
+    }
+  }
+
   // Camera Orbit / Third-Person Flight Chase
   if (params.followCam) {
     const camDist = 6.5;
@@ -1450,8 +1799,9 @@ function animate() {
     const targetZ = drone.position.z - localForward.z * camDist;
     const targetY = Math.max(0.6, drone.position.y + camHeight);
 
-    camera.position.lerp(new THREE.Vector3(targetX, targetY, targetZ), 0.08);
-    controls.target.lerp(drone.position.clone().add(new THREE.Vector3(0, 0.35, localForward.z * 1.5)), 0.12);
+    _tv1.set(targetX, targetY, targetZ); camera.position.lerp(_tv1, 0.08);
+    _tv1.copy(drone.position); _tv1.y += 0.35; _tv1.z += localForward.z * 1.5;
+    controls.target.lerp(_tv1, 0.12);
   }
   controls.update();
 

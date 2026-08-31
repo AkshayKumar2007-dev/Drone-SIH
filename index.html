@@ -142,6 +142,30 @@
           <div class="hint2" id="oil-hint">MAP 98 kPa · Fuel 44 psi</div>
         </div>
       </div>
+      <!-- Motor Health + Battery Voltage + Emergency -->
+      <div class="power">
+        <div class="p">
+          <div class="p-head"><span>⚡ Motors</span><strong id="motor-summary">4/4 OK</strong></div>
+          <div style="display:flex;gap:6px;margin-top:6px">
+            <div style="flex:1;text-align:center"><div style="font-size:9px;color:#7a8a9a">FR</div><div class="bar"><i id="m0-bar" style="width:100%;background:linear-gradient(90deg,#00ff88,#00d0ff)"></i></div><div style="font-size:9px;color:#eafff2;font-family:ui-monospace,monospace" id="m0-pct">100%</div></div>
+            <div style="flex:1;text-align:center"><div style="font-size:9px;color:#7a8a9a">FL</div><div class="bar"><i id="m1-bar" style="width:100%;background:linear-gradient(90deg,#00ff88,#00d0ff)"></i></div><div style="font-size:9px;color:#eafff2;font-family:ui-monospace,monospace" id="m1-pct">100%</div></div>
+            <div style="flex:1;text-align:center"><div style="font-size:9px;color:#7a8a9a">RR</div><div class="bar"><i id="m2-bar" style="width:100%;background:linear-gradient(90deg,#00ff88,#00d0ff)"></i></div><div style="font-size:9px;color:#eafff2;font-family:ui-monospace,monospace" id="m2-pct">100%</div></div>
+            <div style="flex:1;text-align:center"><div style="font-size:9px;color:#7a8a9a">RL</div><div class="bar"><i id="m3-bar" style="width:100%;background:linear-gradient(90deg,#00ff88,#00d0ff)"></i></div><div style="font-size:9px;color:#eafff2;font-family:ui-monospace,monospace" id="m3-pct">100%</div></div>
+          </div>
+          <div class="hint2" id="motor-hint">All motors nominal</div>
+        </div>
+        <div class="p">
+          <div class="p-head"><span>🔋 Voltage</span><strong id="volt-pct">12.6V</strong></div>
+          <div class="bar" id="volt-bar"><i id="volt-fill" style="width:100%; background:linear-gradient(90deg,#ffd43a,#ff8a00)"></i></div>
+          <div class="hint2" id="volt-hint">Nominal · No sag</div>
+        </div>
+      </div>
+      <div id="emergency-banner" style="display:none; margin:8px 0; padding:9px 12px; border-radius:8px; font-size:12px; font-weight:900; letter-spacing:0.10em; text-align:center; background:rgba(255,58,58,0.25); border:1px solid #ff4a4a; color:#ff7a7a; animation:blink 0.5s step-start infinite;">
+        🚨 EMERGENCY
+      </div>
+      <div id="stall-banner" style="display:none; margin:8px 0; padding:8px 12px; border-radius:8px; font-size:11px; font-weight:800; letter-spacing:0.08em; text-align:center; background:rgba(255,165,0,0.22); border:1px solid #ff9500; color:#ffb84d; animation:blink 0.6s step-start infinite;">
+        ⚠️ STALL WARNING
+      </div>
     </div>
     <div class="hint">
       <div><strong>Drag mouse</strong> to orbit · <strong>Scroll</strong> to zoom</div>
@@ -156,7 +180,7 @@
         <li><kbd>W</kbd> <kbd>S</kbd> Pitch (Forward / Back)</li>
         <li><kbd>A</kbd> <kbd>D</kbd> Roll (Bank Left / Right)</li>
         <li><kbd>Q</kbd> <kbd>E</kbd> / <kbd>←</kbd> <kbd>→</kbd> Yaw (Rotate Left / Right)</li>
-        <li><kbd>M</kbd> Flight Mode (Stabilize / Alt-Hold / Acro)</li>
+        <li><kbd>M</kbd> Flight Mode (Stab / Alt-Hold / Loiter / Acro)</li>
         <li><kbd>X</kbd> Arm / Disarm Toggle</li>
         <li><kbd>U</kbd> Mute / Unmute Audio</li>
         <li><kbd>C</kbd> Camera Follow Toggle</li>
