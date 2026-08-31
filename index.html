@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Realistic 3D Drone Simulator</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { overflow:hidden; background:#0a0a0f; font-family:'Segoe UI', system-ui, sans-serif; user-select:none; }
+    #canvas-container { width:100vw; height:100vh; display:block; }
+    .ui { position:absolute; inset:0; pointer-events:none; }
+    .hud {
+      position:absolute; top:16px; left:16px;
+      background:rgba(10,14,22,0.82); border:1px solid rgba(0,255,120,0.22);
+      padding:14px 18px; border-radius:12px; backdrop-filter:blur(10px);
+      min-width: 390px; box-shadow:0 8px 32px rgba(0,0,0,0.45);
+    }
+    .hud h1 { font-size:13px; letter-spacing:0.18em; color:#00ff88; margin-bottom:10px; display:flex; justify-content:space-between; align-items:center; }
+    .hud h1 .tag { font-size:10px; padding:2px 6px; border-radius:4px; background:rgba(0,255,136,0.15); border:1px solid rgba(0,255,136,0.3); }
+    .stats { display:flex; gap:16px; flex-wrap:wrap; font-size:12px; }
+    .stat { display:flex; flex-direction:column; min-width:54px; }
+    .stat .label { color:#7a8a9a; font-size:10px; letter-spacing:0.08em; text-transform:uppercase; }
+    .stat .value { color:#eafff2; font-family: ui-monospace, monospace; font-size:15px; font-weight:700; }
+    .stat .unit { color:#7a8a9a; font-size:10px; }
+    .controls {
+      position:absolute; bottom:16px; left:16px;
+      background:rgba(10,14,22,0.82); border:1px solid rgba(255,255,255,0.12);
+      padding:14px 18px; border-radius:12px; color:#d6e2ee; font-size:12px; line-height:1.5;
+      backdrop-filter:blur(10px); box-shadow:0 8px 32px rgba(0,0,0,0.45);
+    }
+    .controls h3 { color:#00ff88; font-size:11px; letter-spacing:0.12em; margin-bottom:8px; }
+    .controls ul { list-style:none; columns:2; column-gap:22px; }
+    .controls li { margin:3px 0; white-space:nowrap; }
+    .controls kbd { background:#1a2332; border:1px solid #2a3a52; border-bottom-width:2px; padding:2px 6px; border-radius:4px; font-family:ui-monospace,monospace; font-size:11px; color:#eafff2; }
+    .hint {
+      position:absolute; top:16px; right:16px;
+      background:rgba(10,14,22,0.82); border:1px solid rgba(255,255,255,0.1);
+      padding:12px 16px; border-radius:12px; color:#9aadc2; font-size:11px; text-align:right;
+      backdrop-filter:blur(10px); box-shadow:0 8px 32px rgba(0,0,0,0.45);
+    }
+    .hint strong { color:#eafff2; }
+    .power { display:flex; gap:12px; margin-top:12px; }
+    .power .p { flex:1; min-width:150px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.08); border-radius:8px; padding:8px 10px; }
+    .power .p-head { display:flex; justify-content:space-between; align-items:center; font-size:10px; letter-spacing:0.08em; text-transform:uppercase; color:#9aadc2; }
+    .power .p-head strong { color:#eafff2; font-size:12px; font-family:ui-monospace,monospace; }
+    .bar { height:6px; background:#1a2332; border-radius:999px; overflow:hidden; margin-top:6px; }
+    .bar i { display:block; height:100%; width:100%; background:linear-gradient(90deg,#00ff88,#00d0ff); transition:width 0.15s, background 0.15s; }
+    .bar.batt i { background:linear-gradient(90deg,#ffd43a,#ff8a00); }
+    .bar.fuel.low i { background:linear-gradient(90deg,#ff3a3a,#ff8a00); }
+    .bar.batt.low i { background:linear-gradient(90deg,#ff3a3a,#ff0055); }
+    .p .hint2 { font-size:10px; color:#7a8a9a; margin-top:4px; white-space:nowrap; }
+    .warn { color:#ff3a3a !important; animation:blink 0.7s step-start infinite; }
+    @keyframes blink { 50% { opacity:0.35; } }
+    #crash-overlay {
+      position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+      background:rgba(120,0,0,0.58); backdrop-filter:blur(4px);
+      opacity:0; pointer-events:none; transition:opacity 0.22s;
+      flex-direction:column; gap:10px; z-index:100;
+    }
+    #crash-overlay.show { opacity:1; pointer-events:auto; }
+    #crash-overlay .big { font-size:46px; font-weight:900; color:white; letter-spacing:0.12em; text-shadow:0 4px 18px rgba(0,0,0,0.6); }
+    #crash-overlay .sub { color:#ffd1d1; font-size:14px; letter-spacing:0.08em; }
+    #crash-overlay .btn { margin-top:10px; pointer-events:auto; background:#ff2a2a; color:white; border:none; padding:10px 22px; border-radius:8px; font-weight:700; cursor:pointer; font-size:13px; letter-spacing:0.05em; transition:all 0.15s; }
+    #crash-overlay .btn:hover { background:#ff4444; transform:scale(1.05); }
+    #flash { position:absolute; inset:0; background:white; opacity:0; pointer-events:none; transition:opacity 0.12s; z-index:50; }
+    #flash.hit { opacity:0.72; }
+    #yawroll-banner { margin:8px 0 10px; padding:7px 10px; border-radius:7px; font-size:11px; font-weight:800; letter-spacing:0.10em; text-align:center; background:rgba(0,255,120,0.12); border:1px solid rgba(0,255,120,0.28); color:#00ff88; transition:all 0.2s; }
+    #yawroll-banner.warn { background:rgba(255,212,58,0.14); border-color:#ffd43a; color:#ffd43a; }
+    #yawroll-banner.inst { background:rgba(255,138,0,0.16); border-color:#ff8a00; color:#ff8a00; }
+    #yawroll-banner.crit { background:rgba(255,58,58,0.18); border-color:#ff3a3a; color:#ff6b6b; animation:blink 0.6s step-start infinite; }
+    #yawroll-banner.loss { background:rgba(120,0,0,0.58); border-color:#ff0000; color:white; animation:blink 0.4s step-start infinite; }
+    #arm-banner { margin:8px 0 10px; padding:9px 12px; border-radius:8px; font-size:12px; font-weight:900; letter-spacing:0.10em; text-align:center; transition:all 0.2s; cursor:pointer; pointer-events:auto; }
+    #arm-banner.disarmed { background:rgba(255,60,60,0.2); border:1px solid #ff4a4a; color:#ff7a7a; }
+    #arm-banner.disarmed:hover { background:rgba(255,60,60,0.3); }
+    #arm-banner.armed { background:rgba(0,255,120,0.2); border:1px solid #00ff88; color:#00ff88; }
+  </style>
+</head>
+<body>
+  <div id="canvas-container"></div>
+  <div id="flash"></div>
+  <div id="crash-overlay">
+    <div class="big">💥 CRASHED</div>
+    <div class="sub" id="crash-reason">IMPACT</div>
+    <div class="sub">Press <kbd>R</kbd> or click below to restart</div>
+    <button class="btn" id="crash-reset">RESTART NOW</button>
+  </div>
+  <div class="ui">
+    <div class="hud">
+      <h1>
+        <span>◈ 6-DOF QUADCOPTER</span>
+        <span class="tag">PID STABILIZED</span>
+      </h1>
+      <div id="arm-banner" class="disarmed">● DISARMED — Press Space or X to ARM & FLY</div>
+      <div id="yawroll-banner">NORMAL</div>
+      <div class="stats">
+        <div class="stat"><span class="label">Altitude</span><span><span class="value" id="altitude">0.0</span> <span class="unit">m</span></span></div>
+        <div class="stat"><span class="label">Speed</span><span><span class="value" id="speed">0.0</span> <span class="unit">m/s</span></span></div>
+        <div class="stat"><span class="label">V/Speed</span><span><span class="value" id="vspeed">0.0</span> <span class="unit">m/s</span></span></div>
+        <div class="stat"><span class="label">Heading</span><span><span class="value" id="heading">0°</span></span></div>
+        <div class="stat"><span class="label">Battery</span><span><span class="value" id="batt-hud">100%</span></span></div>
+        <div class="stat"><span class="label">Mode</span><span><span class="value" id="mode-hud">STABILIZE</span></span></div>
+      </div>
+      <div class="stats" style="margin-top:10px; opacity:0.75">
+        <div class="stat"><span class="label">Pitch</span><span><span class="value" id="pitch">0</span><span class="unit">°</span></span></div>
+        <div class="stat"><span class="label">Roll</span><span><span class="value" id="roll">0</span><span class="unit">°</span></span></div>
+        <div class="stat"><span class="label">Yaw</span><span><span class="value" id="yaw">0</span><span class="unit">°</span></span></div>
+        <div class="stat"><span class="label">Cam</span><span><span class="value" id="mode" style="color:#00ff88">FOLLOW</span></span></div>
+      </div>
+      <div class="power">
+        <div class="p">
+          <div class="p-head"><span>⛽ Fuel</span><strong id="fuel-pct">100%</strong></div>
+          <div class="bar fuel" id="fuel-bar"><i id="fuel-fill" style="width:100%"></i></div>
+          <div class="hint2" id="fuel-hint">~2.8 min flight time</div>
+        </div>
+        <div class="p">
+          <div class="p-head"><span>🔋 Battery</span><strong id="batt-pct">100%</strong></div>
+          <div class="bar batt" id="batt-bar"><i id="batt-fill" style="width:100%"></i></div>
+          <div class="hint2" id="batt-hint">Avionics · Servos · OK</div>
+        </div>
+      </div>
+      <div class="power">
+        <div class="p">
+          <div class="p-head"><span>🌡 Engine</span><strong id="eng-temp">68°C</strong></div>
+          <div class="bar" id="eng-bar"><i id="eng-fill" style="width:38%; background:linear-gradient(90deg,#00d0ff,#00ff88)"></i></div>
+          <div class="hint2" id="eng-hint">Oil 100% · Health 100%</div>
+        </div>
+        <div class="p">
+          <div class="p-head"><span>💨 Wind</span><strong id="wind-pct">1.2 m/s</strong></div>
+          <div class="bar" id="wind-bar"><i id="wind-fill" style="width:18%; background:linear-gradient(90deg,#7aa0ff,#b8e0ff)"></i></div>
+          <div class="hint2" id="wind-hint"><kbd>V</kbd> toggle wind</div>
+        </div>
+      </div>
+      <div class="power">
+        <div class="p">
+          <div class="p-head"><span>🎚 Throttle</span><strong id="thr-pct">0%</strong></div>
+          <div class="bar" id="thr-bar"><i id="thr-fill" style="width:0%; background:linear-gradient(90deg,#00ff88,#ffd43a)"></i></div>
+          <div class="hint2" id="thr-hint">Motors Off · Press Space to ARM & FLY</div>
+        </div>
+        <div class="p">
+          <div class="p-head"><span>🔧 Drone Pressure</span><strong id="oil-pct">48 psi</strong></div>
+          <div class="bar" id="oil-bar"><i id="oil-fill" style="width:62%; background:linear-gradient(90deg,#ff8a00,#00ff88)"></i></div>
+          <div class="hint2" id="oil-hint">MAP 98 kPa · Fuel 44 psi</div>
+        </div>
+      </div>
+    </div>
+    <div class="hint">
+      <div><strong>Drag mouse</strong> to orbit · <strong>Scroll</strong> to zoom</div>
+      <div style="margin-top:4px">Press <kbd>Space</kbd> to <strong>Auto-Arm & Climb</strong></div>
+      <div style="margin-top:4px; color:#00ff88">Self-Leveling Gyro Stabilizer Active</div>
+    </div>
+    <div class="controls">
+      <h3>FLIGHT CONTROLS</h3>
+      <ul>
+        <li><kbd>Space</kbd> Climb / Auto-Arm</li>
+        <li><kbd>Shift</kbd> Descend / Touchdown</li>
+        <li><kbd>W</kbd> <kbd>S</kbd> Pitch (Forward / Back)</li>
+        <li><kbd>A</kbd> <kbd>D</kbd> Roll (Bank Left / Right)</li>
+        <li><kbd>Q</kbd> <kbd>E</kbd> / <kbd>←</kbd> <kbd>→</kbd> Yaw (Rotate Left / Right)</li>
+        <li><kbd>M</kbd> Flight Mode (Stabilize / Alt-Hold / Acro)</li>
+        <li><kbd>X</kbd> Arm / Disarm Toggle</li>
+        <li><kbd>U</kbd> Mute / Unmute Audio</li>
+        <li><kbd>C</kbd> Camera Follow Toggle</li>
+        <li><kbd>R</kbd> Reset Drone to Pad</li>
+      </ul>
+    </div>
+  </div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
